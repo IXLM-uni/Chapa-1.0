@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Logs
+*.log
+logs/
+
+# Large files and models
+openvino_models/
+*.bin
+*.onnx
+*.pb
+*.h5
+*.pkl
+*.joblib
+*.model
+*.weights
+output/
+train.spacy
+
+# Environment variables
+.env
+.env.local
+
+# Database
+*.db
+*.sqlite3
+
+# Session files
+*.session
+*.session-journal
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# Project specific
+TEST_DATA.txt
+TEST_DATA_CLEAN.txt
+TEST_DATA_NOTNA_CLEAN.txt
+results/
+exports/
+exports/*.json
+exports/texts_with_embeddings.json
+exports/texts_for_embedding.json
+ner_errors.txt
+llm_analysis_results.jsonl
