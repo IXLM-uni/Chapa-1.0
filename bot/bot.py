@@ -139,18 +139,7 @@ async def main():
             print(f"Ошибка при входе: {str(e)}")
             return
     
-    # Создаем экземпляр DatabaseRequests с передачей session_maker
-    db = DatabaseRequests(session_maker=async_session)
-    bot = Bot(token=BOT_TOKEN)
-    llm_processor = SimpleGeminiProcessor(bot=bot)
-    
-    dp = Dispatcher(storage=MemoryStorage())
-    
-    # Сохраняем инициализированный клиент и другие объекты в диспетчере
-    dp["client"] = client
-    dp["db"] = db
-    
-    # Загружаем модели NLP и эмбеддингов один раз и сохраняем в диспетчере
+    # Загружаем модели NLP и эмбеддингов один раз
     import spacy
     from sentence_transformers import SentenceTransformer
     
@@ -158,6 +147,18 @@ async def main():
     nlp_model = spacy.load("ru_core_news_md")
     embedding_model = SentenceTransformer('intfloat/multilingual-e5-large')
     print("Модели успешно загружены!")
+    
+    # Создаем экземпляр DatabaseRequests с передачей session_maker
+    # Теперь не передаем embedding_model в конструктор
+    db = DatabaseRequests(session_maker=async_session)
+    bot = Bot(token="7690195228:AAFemqlhmZ1v0lpr8znmsfVakVCzGJYi9wg")
+    llm_processor = SimpleGeminiProcessor(bot=bot)
+    
+    dp = Dispatcher(storage=MemoryStorage())
+    
+    # Сохраняем инициализированный клиент и другие объекты в диспетчере
+    dp["client"] = client
+    dp["db"] = db
     
     # Добавляем модели в диспетчер
     dp["nlp_model"] = nlp_model
@@ -168,6 +169,14 @@ async def main():
     dp["vector_search"] = vector_search
     vs_init_globals(vs=vector_search, emb_model=embedding_model)
 
+    # Создаем TextProcessor и передаем ему нужные компоненты
+    text_processor = TextProcessor(
+        db=db,
+        nlp_model=nlp_model,
+        embedding_model_name='intfloat/multilingual-e5-large'
+    )
+    dp["text_processor"] = text_processor
+
     # Передаем нужные объекты в диспетчер
     dp["llm_processor"] = llm_processor
     
@@ -175,13 +184,19 @@ async def main():
     #await run(dp)
     
     # Создаем парсер, передавая ему УЖЕ ИНИЦИАЛИЗИРОВАННЫЙ клиент
-    parser = TelegramParser(db=db, client=client)
+    # и NLP модель
+    parser = TelegramParser(db=db, nlp_model=nlp_model, client=client)
     
     # Инициализируем парсер без повторной инициализации клиента
     if await parser.init():
         print("Парсер Telegram инициализирован, запускаем...")
         # Просто запускаем парсер в фоновом режиме
         asyncio.create_task(parser.run())
+        
+        # --- Запускаем фоновую обработку текстов (эмбеддинги + сущности) ---
+        print("Запуск фоновой обработки текстов...")
+        asyncio.create_task(text_processor.run_background_processing_loop())
+        # ------------------------------------------------------------------
         
         # Получаем эмбеддинги напрямую из базы данных
         print("Получение эмбеддингов для создания FAISS индекса...")

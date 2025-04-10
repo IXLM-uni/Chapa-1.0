@@ -1,8 +1,9 @@
 from sqlalchemy.future import select
-from sqlalchemy import delete
+from sqlalchemy import delete, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from datetime import datetime
-from .models import Users, Channels, UsersChannels, ChannelPosts
+from .models import Users, Channels, UsersChannels, ChannelPosts, Entities, PostEntities
 import uuid
 from typing import List, Optional, Dict, Tuple
 import asyncio
@@ -540,23 +541,32 @@ class DatabaseRequests:
         """Устанавливает экземпляр парсера для использования."""
         self._parser = parser
 
-    async def get_all_channels_with_last_messages(self) -> dict:
-        """
-        Возвращает словарь в формате {channel_id: last_message_id} для всех каналов
-        """
-        channels_dict = {}
-        
-        # Получаем все каналы
-        channels = await self.get_channels_from_db()
-        
-        # Для каждого канала получаем последний message_id
-        for channel in channels:
-            channel_id = channel.tg_channel_id
-            last_message_id = await self.get_last_message_id_from_db(channel_id)
-            channels_dict[channel_id] = last_message_id
-        
-        print(f"DEBUG: get_all_channels_with_last_messages: Получен словарь каналов: {channels_dict}")
-        return channels_dict
+    async def get_all_channels_with_last_messages(self):
+        """Получает все каналы и их последние сообщения, исключая недоступные"""
+        async with self.session() as session:
+            # Получаем только доступные каналы
+            channels = await session.execute(
+                select(Channels.tg_channel_id)
+                .where(Channels.is_unavailable == False)
+            )
+            channel_ids = [row[0] for row in channels]
+            
+            # Получаем последние сообщения для доступных каналов
+            last_messages = {}
+            for channel_id in channel_ids:
+                last_message = await session.execute(
+                    select(ChannelPosts.message_id)
+                    .where(ChannelPosts.peer_id == channel_id)
+                    .order_by(ChannelPosts.message_id.desc())
+                    .limit(1)
+                )
+                last_message_id = last_message.scalar_one_or_none()
+                if last_message_id:
+                    last_messages[channel_id] = last_message_id
+                else:
+                    last_messages[channel_id] = None
+                    
+            return last_messages
 
     async def get_all_message_embeddings(self):
         """
@@ -716,3 +726,110 @@ class DatabaseRequests:
             import traceback
             traceback.print_exc()
             return None
+
+    async def get_channel_by_tg_id(self, tg_channel_id):
+        """Получает канал по его telegram_id"""
+        async with self.session() as session:
+            channel = await session.execute(
+                select(Channels).where(Channels.tg_channel_id == tg_channel_id)
+            )
+            return channel.scalar_one_or_none()
+
+    async def add_entities_for_post(self, post_id: int, lemmas: List[str]) -> None:
+        """Добавляет сущности (леммы) для поста в базу данных, игнорируя дубликаты."""
+        if not lemmas:
+            return
+        
+        try:
+            async with self.session() as session:
+                # 1. Получаем или создаем все нужные сущности (Entities)
+                entities_to_link = []
+                for lemma in lemmas:
+                    # Используем ON CONFLICT DO NOTHING для Entities, если лемма уже есть
+                    stmt_entity = pg_insert(Entities).values(lemma=lemma)
+                    stmt_entity = stmt_entity.on_conflict_do_nothing(index_elements=['lemma'])
+                    await session.execute(stmt_entity)
+                    
+                    # Получаем ID существующей или только что созданной сущности
+                    result = await session.execute(select(Entities.id).where(Entities.lemma == lemma))
+                    entity_id = result.scalar_one_or_none()
+                    if entity_id:
+                        entities_to_link.append(entity_id)
+                
+                # Убираем дубликаты entity_id, если они есть
+                unique_entity_ids = list(set(entities_to_link))
+                
+                if not unique_entity_ids:
+                    return
+
+                # 2. Создаем связи в PostEntities, игнорируя конфликты
+                values_to_insert = [{'post_id': post_id, 'entity_id': eid} for eid in unique_entity_ids]
+                
+                stmt_post_entity = pg_insert(PostEntities).values(values_to_insert)
+                # Игнорируем конфликты по первичному ключу (post_id, entity_id)
+                stmt_post_entity = stmt_post_entity.on_conflict_do_nothing(index_elements=['post_id', 'entity_id'])
+                
+                await session.execute(stmt_post_entity)
+                await session.commit()
+                # Убираем лог, так как он может быть слишком частым
+                # print(f"Добавлены/проигнорированы сущности для поста {post_id}")
+                
+        except Exception as e:
+            # Логируем ошибку, но не прерываем весь процесс из-за одного поста
+            logger.error(f"Ошибка при добавлении сущностей для поста {post_id}: {e}", exc_info=True)
+            # Не пробрасываем ошибку дальше, чтобы цикл обработки мог продолжиться
+            # raise
+
+    async def get_unprocessed_posts(self, batch_size: int) -> List[ChannelPosts]:
+        """Получает порцию необработанных постов (is_processed=False)."""
+        try:
+            async with self.session() as session:
+                stmt = (
+                    select(ChannelPosts)
+                    .where(
+                        ChannelPosts.is_processed == False, 
+                        ChannelPosts.message != None,
+                        ChannelPosts.message != ''
+                    )
+                    .order_by(ChannelPosts.id)
+                    .limit(batch_size)
+                )
+                result = await session.execute(stmt)
+                return result.scalars().all()
+        except Exception as e:
+            logger.error(f"Ошибка при получении необработанных постов: {e}", exc_info=True)
+            return []
+
+    async def update_post_embedding(self, post_id: int, embedding: List[float]) -> bool:
+        """Обновляет эмбеддинг для указанного поста."""
+        try:
+            async with self.session() as session:
+                stmt = (
+                    update(ChannelPosts)
+                    .where(ChannelPosts.id == post_id)
+                    .values(embedding=embedding)
+                )
+                await session.execute(stmt)
+                await session.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении эмбеддинга для поста {post_id}: {e}", exc_info=True)
+            return False
+
+    async def mark_posts_as_processed(self, post_ids: List[int]) -> bool:
+        """Помечает список постов как обработанные (is_processed=True)."""
+        if not post_ids:
+            return True # Нечего делать
+        try:
+            async with self.session() as session:
+                stmt = (
+                    update(ChannelPosts)
+                    .where(ChannelPosts.id.in_(post_ids))
+                    .values(is_processed=True)
+                )
+                await session.execute(stmt)
+                await session.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Ошибка при пометке постов {post_ids} как обработанных: {e}", exc_info=True)
+            return False

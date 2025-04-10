@@ -5,13 +5,21 @@ import csv
 from datetime import datetime
 import os
 from telethon.errors import FloodWaitError, ServerError
+from telethon.errors.rpcerrorlist import PeerIdInvalidError
 from requests.exceptions import ConnectionError
 from database.requests import DatabaseRequests
-from sqlalchemy import insert
+from sqlalchemy import insert, select
 from database.models import ChannelPosts
+from typing import List
+import logging # Добавляем логирование
+
+# Предполагаем, что используется spaCy, импортируем тип для type hinting
+import spacy
+
+logger = logging.getLogger(__name__) # Настраиваем логгер для парсера
 
 class TelegramParser():
-    def __init__(self, db, client=None):
+    def __init__(self, db, nlp_model: spacy.language.Language, client=None):
         # Данные из .env файла
         self.api_id = 24520702
         self.api_hash = '4873fd31ae3a9a93f77fdea2e88ef738'
@@ -21,6 +29,7 @@ class TelegramParser():
         # Добавляем флаг, указывающий, был ли клиент предоставлен извне
         self.client_provided = client is not None
         self.db = db
+        self.nlp_model = nlp_model # Сохраняем NLP модель
         
         # Добавляем семафор для ограничения конкурентных запросов
         self.semaphore = asyncio.Semaphore(3)  # Максимум 3 одновременных запроса
@@ -94,42 +103,45 @@ class TelegramParser():
 
     async def _parse_single_channel(self, channel_id, limit):
         try:
-            try:
-                channel = await self._make_request_with_retry(
-                    self.client.get_entity,
-                    channel_id
-                )
-            except ValueError as e:
-                # Проверяем, является ли это нашей специальной ошибкой приватного канала
-                if str(e) == "PrivateChannelError":
-                    print(f"Канал {channel_id} приватный или недоступен. Пропускаем.")
-                    return []
-                else:
-                    raise  # Пробрасываем другие ошибки ValueError
-            except Exception as e:
-                # Для других типов ошибок
-                raise
+            print(f"\nПопытка парсинга канала с ID: {channel_id}")
+            
+            # Проверяем статус канала в БД
+            channel = await self.db.get_channel_by_tg_id(channel_id)
+            if channel and channel.is_unavailable:
+                print(f"Канал {channel_id} уже помечен как недоступный в БД, пропускаем")
+                return []
+            
+            # Пробуем получить канал через ссылку, если она есть
+            if channel and channel.telegram_link:
+                print(f"Пробуем получить канал через ссылку: {channel.telegram_link}")
+                channel_entity = await self.client.get_entity(channel.telegram_link)
+            else:
+                print(f"У канала {channel_id} нет ссылки в БД, пробуем получить через ID")
+                channel_entity = await self.client.get_entity(channel_id)
+            
+            if not isinstance(channel_entity, Channel):
+                print(f"ID {channel_id} не является каналом, помечаем как недоступный")
+                if channel:
+                    channel.is_unavailable = True
+                    await self.db.session().commit()
+                return []
             
             messages = []
             last_id = self.last_message_ids.get(channel_id)
             
-            async for message in self.client.iter_messages(channel, limit=limit):
-                try:
-                    if last_id and message.id <= last_id:
-                        break
-                    
-                    # Просто добавляем сообщение, игнорируя медиа
-                    messages.append(message)
-                    
-                except Exception as msg_error:
-                    print(f"Ошибка при обработке сообщения {message.id}: {msg_error}")
-                    continue
-                
-            print(f"Собрано {len(messages)} новых сообщений из канала {channel.title}")
+            async for message in self.client.iter_messages(channel_entity, limit=limit):
+                if last_id and message.id <= last_id:
+                    break
+                messages.append(message)
+            
+            print(f"Собрано {len(messages)} новых сообщений из канала {channel_entity.title}")
             return messages
             
         except Exception as e:
-            print(f"Ошибка при парсинге канала {channel_id}: {str(e)}")
+            print(f"Ошибка при парсинге канала {channel_id}: {e}")
+            if channel:
+                channel.is_unavailable = True
+                await self.db.session().commit()
             return []
 
     async def parse_channels(self, limit_per_channel=1000000):
@@ -165,14 +177,54 @@ class TelegramParser():
         
         return all_messages
 
+    def _sync_extract_lemmas(self, text: str) -> List[str]:
+        """Синхронная функция для извлечения лемм с помощью spaCy."""
+        if not text or not self.nlp_model:
+            return []
+        
+        try:
+            doc = self.nlp_model(text)
+            lemmas = [
+                token.lemma_.lower()
+                for token in doc
+                if not token.is_stop
+                and not token.is_punct
+                and not token.is_space
+                and len(token.lemma_) > 2
+                and token.pos_ in {'NOUN', 'PROPN', 'ADJ', 'VERB'}
+            ]
+            return list(set(lemmas))
+        except Exception as e:
+            # Логируем ошибку синхронной части
+            logger.error(f"Sync Error in _sync_extract_lemmas for text: '{text[:50]}...': {e}", exc_info=True)
+            return []
+
+    async def _extract_lemmas(self, text: str) -> List[str]:
+        """Асинхронно извлекает леммы, запуская CPU-bound spaCy в потоке."""
+        if not text or not self.nlp_model:
+            return []
+        try:
+            # Запускаем синхронную CPU-bound функцию в отдельном потоке
+            lemmas = await asyncio.to_thread(self._sync_extract_lemmas, text)
+            return lemmas
+        except Exception as e:
+            # Логируем ошибку асинхронной обертки
+            logger.error(f"Async Error in _extract_lemmas wrapper for text: '{text[:50]}...': {e}", exc_info=True)
+            return []
+
     async def _parse_channel_with_semaphore(self, channel_id, limit, semaphore):
         """Обёртка для парсинга канала с использованием семафора"""
         async with semaphore:
             try:
                 messages = await self._parse_single_channel(channel_id, limit)
                 if messages:
-                    await self.save_to_db(messages)
-                    print(f"Сохранено {len(messages)} сообщений из канала {channel_id} в базу данных")
+                    saved_count = await self.save_to_db(messages)
+                    print(f"Сохранено {saved_count} сообщений из канала {channel_id} в базу данных")
+                    
+                    # --- Начало: Удаление извлечения сущностей ---
+                    # Убираем извлечение сущностей отсюда
+                    # --- Конец: Удаление извлечения сущностей ---
+                    
                 return messages
             except Exception as e:
                 print(f"Ошибка при парсинге канала {channel_id}: {e}")
@@ -249,7 +301,10 @@ class TelegramParser():
         return len(db_objects)
 
 async def main(db):
-    parser = TelegramParser(db)
+    # При вызове main нужно будет передать nlp_model
+    # Пример: nlp = spacy.load("ru_core_news_md")
+    # parser = TelegramParser(db, nlp)
+    parser = TelegramParser(db) # Пока оставляем так, т.к. main не используется напрямую в боте
     if await parser.init():
         await parser.run()
     else:

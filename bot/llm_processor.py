@@ -119,7 +119,13 @@ async def semantic_search_tool(
         logging.info(f"Получены отранжированные результаты: {len(ranked_results)} сообщений")
         
         # Создаем ответ с использованием LLM
-        llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.7)
+        # Добавляем API ключ напрямую
+        api_key = "AIzaSyAR3IRvu_WIrMPfbnyL5wyhcgXBW2UCGcU" 
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash", 
+            temperature=0.7,
+            google_api_key=api_key
+        )
         
         # Подготавливаем сообщения из результатов
         messages_data = []
