@@ -14,7 +14,8 @@ from bot.handlers import start_handlers, channel_add_handler, channel_delete_han
 from bot.middlewares.user_middleware import UserMiddleware
 from database.models import Base, ChannelPosts
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from config import POSTGRES_ASYNC_URL, BOT_TOKEN
+# Импортируем переменные из config
+from config import POSTGRES_ASYNC_URL, BOT_TOKEN, TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE_NUMBER
 from database.requests import DatabaseRequests
 from bot.llm_processor import SimpleGeminiProcessor, set_db_instance
 from bot.parser import TelegramParser, main as parser_main
@@ -123,9 +124,9 @@ async def run(dp):
     print("Автоматическое добавление каналов завершено")
 
 async def main():
-    # Создаем клиент Telethon с корректными настройками (как в парсере)
-    client = TelegramClient('session_name', 24520702, '4873fd31ae3a9a93f77fdea2e88ef738')
-    phone_number = '+79254323035'
+    # Создаем клиент Telethon с корректными настройками из config
+    client = TelegramClient('session_name', TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    phone_number = TELEGRAM_PHONE_NUMBER
     
     # Инициализация клиента по правильному алгоритму из парсера
     await client.start()
@@ -151,7 +152,7 @@ async def main():
     # Создаем экземпляр DatabaseRequests с передачей session_maker
     # Теперь не передаем embedding_model в конструктор
     db = DatabaseRequests(session_maker=async_session)
-    bot = Bot(token="7690195228:AAFemqlhmZ1v0lpr8znmsfVakVCzGJYi9wg")
+    bot = Bot(token=BOT_TOKEN) # Используем BOT_TOKEN из config
     llm_processor = SimpleGeminiProcessor(bot=bot)
     
     dp = Dispatcher(storage=MemoryStorage())

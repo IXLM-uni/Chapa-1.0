@@ -34,7 +34,7 @@ ENV/
 
 # Jupyter Notebook
 .ipynb_checkpoints
-*.ipynb
+# *.ipynb
 
 # Logs
 *.log
@@ -50,7 +50,7 @@ openvino_models/
 *.joblib
 *.model
 *.weights
-output/
+# output/
 train.spacy
 
 # Environment variables

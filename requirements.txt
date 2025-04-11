@@ -1,0 +1,21 @@
+# Рекомендуется заменить версии на актуальные из вашего окружения через pip freeze
+aiogram~=3.0
+sqlalchemy~=2.0
+asyncpg~=0.29
+telethon~=1.30
+google-generativeai~=0.5
+langchain~=0.2
+langchain-community~=0.2
+langchain-core~=0.2
+langchain-google-genai~=1.0
+spacy~=3.7
+# Загрузите модель отдельно: python -m spacy download ru_core_news_md
+sentence-transformers~=2.7
+torch~=2.2
+optimum[openvino,nncf]~=1.19
+numpy~=1.26
+python-dotenv~=1.0
+psutil~=5.9
+requests~=2.31
+tenacity~=8.2
+faiss-cpu~=1.8 # или faiss-gpu 

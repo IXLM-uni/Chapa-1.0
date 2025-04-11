@@ -11,7 +11,7 @@ def test_special_chars() -> List[Tuple[str, List[Tuple[str, str]]]]:
     Возвращает список тестовых примеров с их сущностями
     """
     # Загружаем модель
-    nlp = spacy.load("ru_core_news_lg")
+    nlp = spacy.load("ru_core_news_md")
     
     # Тестовые примеры с разными специальными символами
     test_cases = [

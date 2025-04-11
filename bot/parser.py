@@ -12,6 +12,8 @@ from sqlalchemy import insert, select
 from database.models import ChannelPosts
 from typing import List
 import logging # Добавляем логирование
+# Импортируем переменные из config
+from config import TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE_NUMBER
 
 # Предполагаем, что используется spaCy, импортируем тип для type hinting
 import spacy
@@ -20,10 +22,10 @@ logger = logging.getLogger(__name__) # Настраиваем логгер дл�
 
 class TelegramParser():
     def __init__(self, db, nlp_model: spacy.language.Language, client=None):
-        # Данные из .env файла
-        self.api_id = 24520702
-        self.api_hash = '4873fd31ae3a9a93f77fdea2e88ef738'
-        self.phone_number = '+79254323035'
+        # Используем значения из config
+        self.api_id = TELEGRAM_API_ID
+        self.api_hash = TELEGRAM_API_HASH
+        self.phone_number = TELEGRAM_PHONE_NUMBER
         # Используем переданный клиент или создаем новый
         self.client = client or TelegramClient('session_name', self.api_id, self.api_hash)
         # Добавляем флаг, указывающий, был ли клиент предоставлен извне

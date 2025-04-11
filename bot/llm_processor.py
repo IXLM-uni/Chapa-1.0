@@ -14,7 +14,7 @@ from langchain_core.tools import InjectedToolArg, tool
 from bot.handlers.start_handlers import show_chats_list, add_channel_start
 from bot.handlers.channel_delete_handler import delete_channel_start
 from sqlalchemy import text, select
-from config import POSTGRES_ASYNC_URL
+from config import POSTGRES_ASYNC_URL, GEMINI_API_KEY
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from database.models import ChannelPosts
 from services.vector_search import get_vector_search, get_embedding_model
@@ -119,12 +119,12 @@ async def semantic_search_tool(
         logging.info(f"Получены отранжированные результаты: {len(ranked_results)} сообщений")
         
         # Создаем ответ с использованием LLM
-        # Добавляем API ключ напрямую
-        api_key = "AIzaSyAR3IRvu_WIrMPfbnyL5wyhcgXBW2UCGcU" 
+        # Добавляем API ключ напрямую - УБИРАЕМ, используем из config
+        # api_key = "AIzaSyAR3IRvu_WIrMPfbnyL5wyhcgXBW2UCGcU" 
         llm = ChatGoogleGenerativeAI(
             model="gemini-1.5-flash", 
             temperature=0.7,
-            google_api_key=api_key
+            google_api_key=GEMINI_API_KEY # Используем ключ из config
         )
         
         # Подготавливаем сообщения из результатов
@@ -190,13 +190,15 @@ class SimpleGeminiProcessor:
     """Простой обработчик сообщений с Gemini API без дублирования функциональности aiogram."""
 
     def __init__(self, bot: Bot = None):
-        # Получаем ключ API из переменной окружения
-        api_key = "AIzaSyAR3IRvu_WIrMPfbnyL5wyhcgXBW2UCGcU"
+        # Используем ключ API из config
+        api_key = GEMINI_API_KEY
+        if not api_key:
+            raise ValueError("Отсутствует ключ API Gemini (GEMINI_API_KEY)")
         genai.configure(api_key=api_key)
         
         # Создаем исходную модель и сохраняем ее
         self.original_llm = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash", 
+            model="gemini-1.5-flash", 
             temperature=1, 
             google_api_key=api_key
         )
