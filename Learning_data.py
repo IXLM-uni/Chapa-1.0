@@ -11,6 +11,9 @@ import aiofiles
 import gc
 import traceback
 
+# Импортируем ключ API из конфига
+from config import GEMINI_API_KEY, POSTGRES_ASYNC_URL
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -32,7 +35,7 @@ class DataProcessor:
         
         logger.info("Подключение к базе данных...")
         self.engine = create_async_engine(
-            "postgresql+asyncpg://postgres:12345@localhost:5432/postgres",
+            POSTGRES_ASYNC_URL, # Используем URL из конфига
             echo=False
         )
         self.SessionLocal = async_sessionmaker(bind=self.engine, class_=AsyncSession)
@@ -40,9 +43,9 @@ class DataProcessor:
         
         logger.info("Инициализация Google Gemini LLM...")
         self.llm = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
+            model="gemini-1.5-flash",
             temperature=0,
-            google_api_key="AIzaSyAR3IRvu_WIrMPfbnyL5wyhcgXBW2UCGcU"
+            google_api_key=GEMINI_API_KEY # Используем ключ из конфига
         )
         logger.info("LLM успешно инициализирована")
         
