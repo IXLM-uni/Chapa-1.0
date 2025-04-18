@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+import psutil
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.fsm.storage.memory import MemoryStorage
 from langchain_community.chat_message_histories import SQLChatMessageHistory
@@ -23,6 +24,10 @@ from telethon import TelegramClient
 from database.requests import DatabaseRequests
 from services.text_processing import TextProcessor
 from services.vector_search import FaissIndexManager, init_globals as vs_init_globals
+
+# ---> ЯВНО ИМПОРТИРУЕМ STATES ЗДЕСЬ <--- 
+import states
+# ---------------------------------------
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
@@ -57,6 +62,12 @@ class SentenceTransformerEmbeddings(LCEmbeddings):
     
     def embed_query(self, text):
         return self.model.encode(text, normalize_embeddings=True).tolist()
+
+def log_ram_usage(stage: str):
+    """Логирует использование RAM текущим процессом."""
+    process = psutil.Process(os.getpid())
+    rss_mb = process.memory_info().rss / (1024 * 1024) # Resident Set Size в MB
+    logging.info(f"[RAM Usage] Before {stage}: {rss_mb:.2f} MB")
 
 async def run(dp):
     """Автоматически добавляет заданные каналы для пользователя"""
@@ -124,6 +135,7 @@ async def run(dp):
     print("Автоматическое добавление каналов завершено")
 
 async def main():
+    log_ram_usage("Starting main")
     # Создаем клиент Telethon с корректными настройками из config
     client = TelegramClient('session_name', TELEGRAM_API_ID, TELEGRAM_API_HASH)
     phone_number = TELEGRAM_PHONE_NUMBER
@@ -144,17 +156,26 @@ async def main():
     import spacy
     from sentence_transformers import SentenceTransformer
     
+    log_ram_usage("Loading spacy model")
     print("Загрузка моделей NLP и эмбеддингов...")
     nlp_model = spacy.load("ru_core_news_md")
+    log_ram_usage("Loading SentenceTransformer model")
     embedding_model = SentenceTransformer('intfloat/multilingual-e5-large')
     print("Модели успешно загружены!")
-    
+    log_ram_usage("Models loaded")
+
+    # Импортируем функцию инициализации глобальных переменных из vector_search
+    from services.vector_search import init_globals as vs_init_globals # Импортируем под другим именем
+    vs_init_globals(emb_model=embedding_model) # Передаем загруженную модель
+
     # Создаем экземпляр DatabaseRequests с передачей session_maker
-    # Теперь не передаем embedding_model в конструктор
+    log_ram_usage("Initializing DatabaseRequests")
     db = DatabaseRequests(session_maker=async_session)
+    log_ram_usage("Initializing Bot")
     bot = Bot(token=BOT_TOKEN) # Используем BOT_TOKEN из config
-    llm_processor = SimpleGeminiProcessor(bot=bot)
-    
+    log_ram_usage("Initializing LLMProcessor")
+    llm_processor = SimpleGeminiProcessor(bot=bot, nlp_model=nlp_model, embedding_model=embedding_model)
+    log_ram_usage("Initializing Dispatcher")
     dp = Dispatcher(storage=MemoryStorage())
     
     # Сохраняем инициализированный клиент и другие объекты в диспетчере
@@ -166,17 +187,20 @@ async def main():
     dp["embedding_model"] = embedding_model
     
     # Создаем и инициализируем FAISS индекс
-    vector_search = FaissIndexManager(omp_threads=4)
+    log_ram_usage("Initializing FaissIndexManager")
+    # Параметры для IVFPQ
+    vector_search = FaissIndexManager(dimension=1024, nlist=100, m=8, bits=8, nprobe=10)
     dp["vector_search"] = vector_search
-    vs_init_globals(vs=vector_search, emb_model=embedding_model)
+    # Глобальные переменные будут установлены при загрузке/обучении индекса
 
     # Создаем TextProcessor и передаем ему нужные компоненты
-    text_processor = TextProcessor(
-        db=db,
-        nlp_model=nlp_model,
-        embedding_model_name='intfloat/multilingual-e5-large'
-    )
-    dp["text_processor"] = text_processor
+    log_ram_usage("Initializing TextProcessor")
+    #text_processor = TextProcessor(
+    #    db=db,
+    #    nlp_model=nlp_model,
+    #    embedding_model_name='intfloat/multilingual-e5-large'
+    #)
+    #dp["text_processor"] = text_processor
 
     # Передаем нужные объекты в диспетчер
     dp["llm_processor"] = llm_processor
@@ -186,39 +210,114 @@ async def main():
     
     # Создаем парсер, передавая ему УЖЕ ИНИЦИАЛИЗИРОВАННЫЙ клиент
     # и NLP модель
+    log_ram_usage("Initializing Parser")
     parser = TelegramParser(db=db, nlp_model=nlp_model, client=client)
     
     # Инициализируем парсер без повторной инициализации клиента
     if await parser.init():
         print("Парсер Telegram инициализирован, запускаем...")
+        dp["parser"] = parser
+
+        log_ram_usage("Starting Parser Task")
         # Просто запускаем парсер в фоновом режиме
-        asyncio.create_task(parser.run())
+        parser_task = asyncio.create_task(parser.run())
         
         # --- Запускаем фоновую обработку текстов (эмбеддинги + сущности) ---
         print("Запуск фоновой обработки текстов...")
-        asyncio.create_task(text_processor.run_background_processing_loop())
+        log_ram_usage("Starting Text Processor Task")
+        #text_processor_task = asyncio.create_task(text_processor.run_background_processing_loop())
         # ------------------------------------------------------------------
         
         # Получаем эмбеддинги напрямую из базы данных
+        log_ram_usage("Getting embeddings from DB")
         print("Получение эмбеддингов для создания FAISS индекса...")
-        message_embeddings = await db.get_all_message_embeddings()
+        all_embeddings_data_raw = await db.get_all_message_embeddings()
+
+        # Фильтруем эмбеддинги по длине текста > 50 символов
+        all_embeddings_data = [
+            (msg_id, peer_id, emb)
+            for msg_id, peer_id, message, emb in all_embeddings_data_raw
+            if message and len(message) > 50
+        ]
+        print(f"Отфильтровано по длине текста (> 50): осталось {len(all_embeddings_data)} из {len(all_embeddings_data_raw)} эмбеддингов")
+        log_ram_usage("Filtered embeddings")
         
         # Добавьте подробное логирование
-        if message_embeddings:
-            print(f"Загружено {len(message_embeddings)} эмбеддингов, создаем FAISS индекс...")
+        if all_embeddings_data:
+            log_ram_usage("Before FAISS Index Init/Load")
+            print(f"Загружено {len(all_embeddings_data)} эмбеддингов, создаем/загружаем FAISS индекс...")
             # Используем менеджер для создания индекса
-            success = await vector_search.create_index(message_embeddings)
+            # !!ВАЖНО!!: Здесь должна быть логика для IndexIVFPQ (обучение/загрузка/добавление),
+            # пока оставим старую логику создания IndexFlatL2 для примера
+            # success = await vector_search.create_index(all_embeddings_data)
+
+            # --- Логика инициализации/загрузки IndexIVFPQ --- 
+            index_file = "faiss_index.ivfpq"
+            metadata_file = "faiss_metadata.pkl"
+            success = False
+            try:
+                import os
+                import numpy as np
+                # pickle уже импортирован в vector_search
+
+                if os.path.exists(index_file) and os.path.exists(metadata_file):
+                    log_ram_usage("Loading existing FAISS index")
+                    print(f"Загрузка существующего индекса из {index_file}...")
+                    success = await vector_search.load_index(index_file, metadata_file)
+                    if not success:
+                         print("Не удалось загрузить индекс, пробуем создать новый...")
+                         if os.path.exists(index_file): os.remove(index_file)
+                         if os.path.exists(metadata_file): os.remove(metadata_file)
+
+                # Если индекс не загружен (файлов нет или загрузка не удалась)
+                if not success:
+                    log_ram_usage("Creating new FAISS index")
+                    print("Сохраненный индекс не найден или не загружен, создаем новый...")
+                    all_vectors = np.array([emb for _, _, emb in all_embeddings_data if emb], dtype=np.float32)
+                    if len(all_vectors) > 0:
+                        # Обучение
+                        num_vectors = len(all_vectors)
+                        num_train = min(num_vectors, 100000) # Берем до 10к для обучения
+                        if num_train < vector_search.nlist * 30:
+                           print(f"ПРЕДУПРЕЖДЕНИЕ: Недостаточно данных для обучения ({num_train} < {vector_search.nlist * 30}). Качество индекса может быть низким.")
+
+                        log_ram_usage("Selecting training data")
+                        print(f"Выборка {num_train} векторов для обучения...")
+                        indices = np.random.choice(num_vectors, num_train, replace=False)
+                        training_vectors = all_vectors[indices]
+
+                        log_ram_usage("Training FAISS index")
+                        train_success = await vector_search.train_index(training_vectors)
+
+                        if train_success:
+                            log_ram_usage("Adding embeddings to FAISS index")
+                            print("Добавление эмбеддингов в обученный индекс...")
+                            add_success = await vector_search.add_embeddings(all_embeddings_data)
+
+                            if add_success:
+                                log_ram_usage("Saving new FAISS index")
+                                print("Сохранение нового индекса...")
+                                save_success = await vector_search.save_index(index_file, metadata_file)
+                                success = save_success
+                            else:
+                                print("Ошибка добавления эмбеддингов в индекс.")
+                        else:
+                            print("Ошибка обучения индекса.")
+                    else:
+                        print("Нет валидных векторов для создания индекса.")
+            except Exception as e:
+                 print(f"Критическая ошибка при инициализации/загрузке FAISS индекса: {e}", exc_info=True)
+            # --- Конец логики инициализации/загрузки IndexIVFPQ ---
+
             if success:
-                print("FAISS индекс успешно создан!")
-            else:
-                print("ОШИБКА: Не удалось создать FAISS индекс!")
+                 vs_init_globals(vs=vector_search) # Устанавливаем глобальную переменную
+                 log_ram_usage("FAISS Index Ready")
+                 print("FAISS индекс успешно создан/загружен!")
         else:
             print("ПРЕДУПРЕЖДЕНИЕ: Нет эмбеддингов для создания FAISS индекса на старте.")
         
     else:
         print("Не удалось инициализировать парсер Telegram")
-        
-    db.set_parser(parser)
     
     # Запускаем обновление метаданных каналов
     print("Запуск проверки и обновления метаданных каналов...")
@@ -226,6 +325,7 @@ async def main():
     #asyncio.create_task(db.update_all_empty_channel_metadata(force_update=False, max_channels=10))
     
     # Затем регистрируем роутеры и запускаем бота
+    log_ram_usage("Registering handlers")
     dp.include_router(start_handlers.router)
     dp.include_router(channel_add_handler.router)
     dp.include_router(channel_delete_handler.router)
@@ -235,6 +335,7 @@ async def main():
     set_db_instance(db)  # Передаем готовый экземпляр
 
     try:
+        log_ram_usage("Starting bot polling")
         await dp.start_polling(bot)
     except Exception as e:
         logging.error(f"Возникла ошибка: {e}")

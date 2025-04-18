@@ -1,14 +1,15 @@
 from sqlalchemy.future import select
-from sqlalchemy import delete, update
+from sqlalchemy import delete, update, exists
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from datetime import datetime
 from .models import Users, Channels, UsersChannels, ChannelPosts, Entities, PostEntities
 import uuid
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Union
 import asyncio
 from sqlalchemy import desc
 import logging
+from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger(__name__)
 
@@ -72,70 +73,59 @@ class DatabaseRequests:
             )
             return result.scalar_one_or_none()
 
-    async def add_channel(self, channel_id, client, telegram_id: int, name: str = "") -> bool:
+    async def add_channel(self, channel_id, client, telegram_id: int, name: str = "") -> Tuple[Union[bool, None], bool, Optional[int]]:
         """
-        Добавляет канал и создает связь с пользователем.
-        
-        Args:
-            channel_id: ID канала в Telegram (tg_channel_id)
-            telegram_id: ID пользователя в Telegram 
-            name: Название канала
-            
-        Returns:
-            bool: Успешно ли добавлен канал
-        """
-        # Получение entity по username, затем извлечение ID
-        channel = await client.get_entity(channel_id)  # где channel_id содержит ссылку или username
-        if channel is None:
-            print(f"Ошибка: channel_id={channel_id} не найден")
-            return False
-        channel_id = channel.id
-        channel_title = channel.title
+        Добавляет канал и создает связь с пользователем, с предварительной проверкой.
 
-        # Удаляем timezone info из datetime
-        channel_date = channel.date.replace(tzinfo=None) if channel.date else None
-        
-        # Пытаемся получить данные канала через LLM
-        channel_metadata = await self._analyze_channel_with_llm(client, channel_id)
-        
-        # Если LLM не смогла определить метаданные, используем значения по умолчанию
-        if not channel_metadata:
+        Args:
+            channel_id: ID канала в Telegram (tg_channel_id) или ссылка/юзернейм
+            telegram_id: ID пользователя в Telegram
+            client: Telethon клиент
+            name: Название канала (не используется, если получаем из Telethon)
+
+        Returns:
+            Tuple[Union[bool, None], bool, Optional[int]]: Кортеж:
+              - status: True (успешно), None (уже подписан), False (ошибка).
+              - was_new: True, если канал был новым в БД, иначе False.
+              - tg_channel_id: Числовой ID канала или None при ошибке.
+        """
+        tg_channel_id = None # Инициализируем на случай ранней ошибки
+        was_channel_new = False # Флаг нового канала
+
+        try:
+            # Получение entity по username или ссылке
+            logger.debug(f"Получение entity для идентификатора: {channel_id}")
+            channel_entity = await client.get_entity(channel_id)
+            if channel_entity is None:
+                logger.error(f"Не удалось найти entity для идентификатора: {channel_id}")
+                return False, was_channel_new, None # Возвращаем кортеж
+
+            tg_channel_id = channel_entity.id # Присваиваем ID здесь
+            channel_title = getattr(channel_entity, 'title', f"Канал {tg_channel_id}")
+            channel_username = getattr(channel_entity, 'username', None)
+            channel_date = getattr(channel_entity, 'date', None)
+            if channel_date:
+                channel_date = channel_date.replace(tzinfo=None)
+
+            logger.debug(f"Получен канал: ID={tg_channel_id}, Title='{channel_title}', Username={channel_username}")
+
+            # Пытаемся получить данные канала через LLM (если нужно)
+            # Здесь можно добавить логику для channel_metadata, как было раньше,
+            # но для исправления ошибки дубликата она не критична.
+            # Пока пропустим LLM часть для ясности исправления.
             channel_theme_id = None
-            channel_is_new = True
+            channel_is_new = True # Предполагаем, что новый, если не анализировали
             channel_categories = []
             channel_styles = []
             channel_sources_info = []
             channel_key_themes = []
             channel_main_theme = []
-        else:
-            channel_categories = channel_metadata.get('categories', [])
-            channel_styles = channel_metadata.get('styles', [])
-            channel_sources_info = channel_metadata.get('sources_info', [])
-            channel_key_themes = channel_metadata.get('key_themes', [])
-            channel_main_theme = channel_metadata.get('main_theme', [])
-            channel_is_new = False
-            channel_theme_id = None
-        
-        # Получаем полную информацию о канале для извлечения дополнительных данных
-        try:
-            from telethon import functions
-            full_channel = await client(functions.channels.GetFullChannelRequest(channel))
-            description = full_channel.full_chat.about
-            participants_count = full_channel.full_chat.participants_count
-            
-            # Пробуем получить ссылку на канал
-            telegram_link = None
-            if channel.username:
-                telegram_link = f"https://t.me/{channel.username}"
-            elif full_channel.full_chat.exported_invite:
-                telegram_link = full_channel.full_chat.exported_invite.link
-        except Exception as e:
-            print(f"Ошибка при получении полной информации о канале: {e}")
             description = None
             participants_count = None
-            telegram_link = None
-        
-        try:
+            telegram_link = f"https://t.me/{channel_username}" if channel_username else None
+            # Можно добавить получение полной информации, как раньше, если нужно
+
+
             async with self.session() as session:
                 # Находим пользователя по telegram_id
                 user_result = await session.execute(
@@ -143,20 +133,24 @@ class DatabaseRequests:
                 )
                 user = user_result.scalar_one_or_none()
                 if not user:
-                    return False
-                
-                # Проверяем существует ли канал
+                    logger.error(f"Пользователь с telegram_id {telegram_id} не найден.")
+                    return False, was_channel_new, tg_channel_id # Возвращаем кортеж
+                logger.debug(f"Найден пользователь ID: {user.id} для telegram_id: {telegram_id}")
+
+                # Проверяем существует ли канал в таблице Channels
                 channel_result = await session.execute(
-                    select(Channels).where(Channels.tg_channel_id == channel_id)
+                    select(Channels).where(Channels.tg_channel_id == tg_channel_id)
                 )
-                channel = channel_result.scalar_one_or_none()
-                
+                db_channel = channel_result.scalar_one_or_none()
+
                 # Если канала нет, создаем новый
-                if not channel:
-                    channel = Channels(
-                        tg_channel_id=channel_id,
-                        channel_name=channel_title,  # Берем название канала из объекта channel
-                        date=channel_date,  # Берем date из объекта channel
+                if not db_channel:
+                    logger.info(f"Канал ID {tg_channel_id} не найден в БД, создаем новый.")
+                    was_channel_new = True # <<< Устанавливаем флаг
+                    db_channel = Channels(
+                        tg_channel_id=tg_channel_id,
+                        channel_name=channel_title,
+                        date=channel_date,
                         theme_id=channel_theme_id,
                         is_new=channel_is_new,
                         categories=channel_categories,
@@ -166,24 +160,60 @@ class DatabaseRequests:
                         participants_count=participants_count,
                         telegram_link=telegram_link,
                         key_themes=channel_key_themes,
-                        main_theme=channel_main_theme
+                        main_theme=channel_main_theme,
                     )
-                    session.add(channel)
+                    session.add(db_channel)
+                    # Используем flush, чтобы получить db_channel.id до коммита
                     await session.flush()
-                
-                # Создаем связь в таблице UsersChannels
-                users_channels = UsersChannels(
-                    user_id=user.id,
-                    channel_id=channel.id
-                )
-                session.add(users_channels)
-                
-                await session.commit()
-                return True
-                
+                    logger.info(f"Новый канал ID {tg_channel_id} добавлен в БД с ID {db_channel.id}.")
+                else:
+                     logger.debug(f"Канал ID {tg_channel_id} уже существует в БД (ID: {db_channel.id}).")
+
+
+                # --- Предварительная проверка существования связи ---
+                logger.debug(f"Проверка наличия связи: user_id={user.id}, channel_id={db_channel.id}")
+                # Используем exists() для эффективности
+                check_stmt = select(exists().where(
+                    UsersChannels.user_id == user.id,
+                    UsersChannels.channel_id == db_channel.id
+                ))
+                check_result = await session.execute(check_stmt)
+                already_exists = check_result.scalar()
+
+                if already_exists:
+                    logger.info(f"Связь user={user.id}, channel={db_channel.id} уже существует.")
+                    # Канал не новый (was_channel_new остается False), но связь есть
+                    return None, was_channel_new, tg_channel_id # <<< Пользователь уже подписан
+                # --- Конец предварительной проверки ---
+
+                # Если связи нет, пытаемся ее создать
+                try:
+                    logger.debug(f"Связь не найдена. Попытка добавить: user_id={user.id}, channel_id={db_channel.id}")
+                    users_channels = UsersChannels(
+                        user_id=user.id,
+                        channel_id=db_channel.id
+                    )
+                    session.add(users_channels)
+                    # Теперь IntegrityError здесь маловероятна, но оставим try на всякий случай
+                    await session.commit()
+                    logger.info(f"Связь между пользователем {user.id} и каналом {db_channel.id} успешно создана.")
+                    # Возвращаем True, флаг нового канала и ID
+                    return True, was_channel_new, tg_channel_id # Успешное добавление
+
+                except Exception as commit_exc:
+                    # Ловим любую ошибку во время commit (если вдруг flush пропустил)
+                    logger.error(f"Неожиданная ошибка при commit связи user={user.id}, channel={db_channel.id}: {commit_exc}", exc_info=True)
+                    try:
+                        await session.rollback() # Откатываем на всякий случай
+                    except Exception as rollback_error:
+                         logger.error(f"Ошибка при откате после ошибки commit: {rollback_error}", exc_info=True)
+                    return False, was_channel_new, tg_channel_id # Возвращаем False при ошибке commit
+
         except Exception as e:
-            print(f"Ошибка при добавлении канала: {e}")
-            return False
+            # Эта ветка ловит ошибки, возникшие ДО блока async with session
+            # (например, client.get_entity)
+            logger.error(f"Общая ошибка (до работы с сессией) при добавлении канала ({channel_id}) для пользователя {telegram_id}: {e}", exc_info=True)
+            return False, was_channel_new, tg_channel_id # Возвращаем кортеж
 
     async def _analyze_channel_with_llm(self, client, channel_id: int, message_limit: int = 20) -> dict:
         """
@@ -570,36 +600,43 @@ class DatabaseRequests:
 
     async def get_all_message_embeddings(self):
         """
-        Асинхронно получает все id и эмбеддинги из базы данных одним запросом.
+        Асинхронно получает все id, peer_id, текст и эмбеддинги из базы данных одним запросом.
 
         Returns:
-            List[Tuple[int, List[float]]]: Список кортежей (id, embedding).
-                                           Возвращает пустой список, если эмбеддинги не найдены.
+            List[Tuple[int, int, str, List[float]]]: Список кортежей (id, peer_id, message, embedding).
+                                                     Возвращает пустой список, если эмбеддинги не найдены.
         """
         try:
             async with self.session() as session:
-                # Получаем только непустые эмбеддинги
-                query = select(ChannelPosts.id, ChannelPosts.embedding).where(
-                    ChannelPosts.embedding != None
+                # Получаем только непустые эмбеддинги, добавляем peer_id и message
+                query = select(ChannelPosts.id, ChannelPosts.peer_id, ChannelPosts.message, ChannelPosts.embedding).where(
+                    ChannelPosts.embedding != None,
+                    ChannelPosts.message != None, # Добавляем проверку на непустое сообщение
+                    ChannelPosts.message != ''
                 )
                 result = await session.execute(query)
-                message_embeddings = result.all()
-                
-            if not message_embeddings:
-                print("В базе данных не найдено эмбеддингов сообщений")
+                message_embeddings_data = result.all()
+
+            if not message_embeddings_data:
+                print("В базе данных не найдено сообщений с эмбеддингами")
                 return []
-            
-            # Фильтруем пустые эмбеддинги
+
+            # Фильтруем пустые эмбеддинги и проверяем peer_id
             valid_embeddings = []
-            for msg_id, embedding in message_embeddings:
+            for msg_id, peer_id, message, embedding in message_embeddings_data:
+                # Проверяем, что peer_id не None
+                if peer_id is None:
+                    print(f"Пропущен эмбеддинг для сообщения ID: {msg_id} из-за отсутствия peer_id")
+                    continue
                 if embedding and len(embedding) > 0:
-                    valid_embeddings.append((msg_id, embedding))
+                    # Текст (message) пока просто пробрасываем дальше
+                    valid_embeddings.append((msg_id, peer_id, message, embedding))
                 else:
                     print(f"Пропущен пустой эмбеддинг для сообщения ID: {msg_id}")
-            
-            print(f"Загружено {len(valid_embeddings)} валидных эмбеддингов из {len(message_embeddings)} записей")
+
+            print(f"Загружено {len(valid_embeddings)} валидных эмбеддингов с peer_id и текстом из {len(message_embeddings_data)} записей")
             return valid_embeddings
-            
+
         except Exception as e:
             print(f"Ошибка при получении эмбеддингов из БД: {e}")
             import traceback
@@ -779,6 +816,34 @@ class DatabaseRequests:
             logger.error(f"Ошибка при добавлении сущностей для поста {post_id}: {e}", exc_info=True)
             # Не пробрасываем ошибку дальше, чтобы цикл обработки мог продолжиться
             # raise
+
+    async def get_entity_ids_by_lemmas(self, lemmas: List[str]) -> List[int]:
+        """Получает ID сущностей по списку лемм."""
+        if not lemmas:
+            return []
+        try:
+            async with self.session() as session:
+                stmt = select(Entities.id).where(Entities.lemma.in_(lemmas))
+                result = await session.execute(stmt)
+                return result.scalars().all()
+        except Exception as e:
+            logger.error(f"Ошибка при получении ID сущностей по леммам {lemmas}: {e}", exc_info=True)
+            return []
+
+    async def get_post_ids_by_entity_ids(self, entity_ids: List[int]) -> List[int]:
+        """Получает список ID постов, связанных с заданными ID сущностей."""
+        if not entity_ids:
+            return []
+        try:
+            async with self.session() as session:
+                stmt = select(PostEntities.post_id).where(PostEntities.entity_id.in_(entity_ids)).distinct()
+                result = await session.execute(stmt)
+                # Преобразуем результат в список int
+                post_ids = [pid for pid, in result.fetchall()]
+                return post_ids
+        except Exception as e:
+            logger.error(f"Ошибка при получении ID постов по ID сущностей {entity_ids}: {e}", exc_info=True)
+            return []
 
     async def get_unprocessed_posts(self, batch_size: int) -> List[ChannelPosts]:
         """Получает порцию необработанных постов (is_processed=False)."""

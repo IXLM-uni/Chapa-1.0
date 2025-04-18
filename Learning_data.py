@@ -120,24 +120,19 @@ class DataProcessor:
     async def get_messages(self, channel_id: int) -> List[str]:
         logger.info(f"Получение сообщений из канала {channel_id}")
         async with self.SessionLocal() as session:
+            # Убираем фильтр по длине, берем все сообщения
             stmt = select(ChannelPosts.message).where(
                 ChannelPosts.peer_id == channel_id,
-                ChannelPosts.message.isnot(None),
-                func.length(ChannelPosts.message) > 100
+                ChannelPosts.message.isnot(None)
+                # func.length(ChannelPosts.message) > 100 # Убираем фильтр
             ).order_by(
-                ChannelPosts.date.desc()
+                ChannelPosts.date.desc() # Оставляем сортировку
             ).limit(self.messages_limit)
             
             result = await session.execute(stmt)
-            messages = [row[0] for row in result.fetchall() if row[0]]
-            logger.info(f"Получено {len(messages)} сообщений из канала {channel_id}")
+            messages = [row[0] for row in result.fetchall() if row[0] and row[0].strip()]
+            logger.info(f"Получено {len(messages)} непустых сообщений из канала {channel_id} (лимит: {self.messages_limit})")
         return messages
-
-    def split_into_sentences(self, text: str) -> List[str]:
-        """Разбивает текст на предложения."""
-        pattern = r'(?<=[.!?…])\s+'
-        sentences = re.split(pattern, text)
-        return [s.strip() for s in sentences if s.strip()]
 
     async def validate_chunk(self, content: str) -> str:
         """Валидирует и исправляет форматирование чанка данных."""
@@ -163,39 +158,57 @@ class DataProcessor:
             logger.warning("Возвращаем исходный контент без валидации")
             return content
 
-    async def process_chunk_async(self, sentences: List[str], llm_number: int):
-        """Асинхронная обработка всех предложений для одной LLM"""
-        try:
-            logger.info(f"LLM {llm_number}: всего получено {len(sentences)} предложений")
-            
-            # Разбиваем предложения на чанки по 100
-            for i in range(0, len(sentences), self.sentences_per_chunk):
-                chunk = sentences[i:i + self.sentences_per_chunk]
-                chunk_number = i // self.sentences_per_chunk + 1
-                total_chunks = (len(sentences) + self.sentences_per_chunk - 1) // self.sentences_per_chunk
+    async def process_single_message_ner(self, message_text: str, semaphore: asyncio.Semaphore):
+        """Обрабатывает ОДНО сообщение для генерации NER-разметки."""
+        async with semaphore:
+            try:
+                # Очищаем текст от лишних пробелов/переносов
+                cleaned_text = ' '.join(message_text.split())
+                if len(cleaned_text) < 10: # Пропускаем слишком короткие
+                    logger.debug(f"Пропуск короткого сообщения: {cleaned_text[:50]}")
+                    return None
+                    
+                # Обновляем промпт для обработки целого сообщения
+                ner_prompt = ChatPromptTemplate.from_messages([
+                    ("system", """Проанализируй ТЕКСТ СООБЩЕНИЯ ЦЕЛИКОМ и найди в нем сущности. 
+                    Верни результат СТРОГО в формате ОДНОГО кортежа:
+                        ('Полный текст сообщения с сохраненными переносами строк и форматированием.', {{'entities': [('текст_сущности', 'ТИП_СУЩНОСТИ')]}})
+                    
+                    Важно:
+                    1. Обработай ВЕСЬ входной текст как ОДИН элемент.
+                    2. Найди ВСЕ сущности во всем тексте сообщения.
+                    3. Для каждой сущности укажи ТОЛЬКО её текст и тип.
+                    4. Сохраняй оригинальные переносы строк и форматирование в тексте сообщения.
+                    5. Текст сообщения должен быть заключен в одинарные кавычки.
+                    6. НЕ ДЕЛАЙ переносов строк внутри самого кортежа.
+                    
+                    Типы сущностей: ORG, PER, LOC, DATE, MONEY, PRODUCT, ROLE, MISC
+                    
+                    Пример правильного формата:
+                    ('Привет! John Smith из Meta выпустил LLaMA 2. Цена A100 упала до 20000 долларов в NYC.', {{'entities': [('John Smith', 'PER'), ('Meta', 'ORG'), ('LLaMA 2', 'PRODUCT'), ('A100', 'PRODUCT'), ('20000 долларов', 'MONEY'), ('NYC', 'LOC')]}})
+                    
+                    Верни ТОЛЬКО ОДИН кортеж с полным текстом сообщения и списком его сущностей."""),
+                    ("human", "{text}")
+                ])
+                ner_chain = ner_prompt | self.llm
+
+                logger.debug(f"Отправка сообщения в LLM для NER: {cleaned_text[:100]}...")
+                response = await ner_chain.ainvoke({"text": cleaned_text})
                 
-                logger.info(f"LLM {llm_number}: обработка чанка {chunk_number}/{total_chunks} ({len(chunk)} предложений)")
-                text_for_llm = "\n".join(chunk)
-                
-                # Первичная обработка
-                logger.info(f"LLM {llm_number}, чанк {chunk_number}: отправка запроса в модель")
-                response = await self.chain.ainvoke({"text": text_for_llm})
-                
-                # Валидация результата
-                logger.info(f"LLM {llm_number}, чанк {chunk_number}: валидация результатов")
-                validated_content = await self.validate_chunk(response.content)
-                
-                # Запись валидированного результата
-                logger.info(f"LLM {llm_number}, чанк {chunk_number}: запись результатов")
-                async with aiofiles.open('TEST_DATA.txt', 'a', encoding='utf-8') as f:
-                    await f.write(validated_content + "\n\n")
-                
-                logger.info(f"LLM {llm_number}: чанк {chunk_number}/{total_chunks} успешно обработан")
-                await asyncio.sleep(2)  # Пауза между чанками
-                
-            logger.info(f"LLM {llm_number}: все чанки успешно обработаны")
-        except Exception as e:
-            logger.error(f"LLM {llm_number}: ошибка при обработке: {e}")
+                # Простая валидация формата (начинается с ( и заканчивается )))
+                if response.content and response.content.strip().startswith("(") and response.content.strip().endswith(")))"):
+                    validated_content = response.content.strip()
+                    logger.debug(f"Получен валидный NER результат: {validated_content[:100]}...")
+                    return validated_content
+                else:
+                    logger.warning(f"Невалидный формат ответа LLM для NER: {response.content}")
+                    return None # Возвращаем None при невалидном формате
+
+            except Exception as e:
+                logger.error(f"Ошибка при обработке сообщения для NER: '{cleaned_text[:50]}...' - {e}", exc_info=True)
+                return None
+            finally:
+                 await asyncio.sleep(1) # Небольшая пауза после каждого запроса к LLM
 
     async def process_channel(self, channel_id: int) -> None:
         try:
@@ -204,109 +217,80 @@ class DataProcessor:
             if not messages:
                 logger.warning(f"Нет сообщений для канала {channel_id}")
                 return
-
-            full_text = " ".join(messages)
-            logger.info(f"Объединено {len(messages)} сообщений в текст")
-
-            all_sentences = self.split_into_sentences(full_text)
-            logger.info(f"Текст разбит на {len(all_sentences)} предложений")
             
-            # Разделяем все предложения между LLM
-            sentences_per_llm = len(all_sentences) // self.num_llms
-            chunks_for_llms = [all_sentences[i:i + sentences_per_llm] for i in range(0, len(all_sentences), sentences_per_llm)]
-            logger.info(f"Предложения разделены между {len(chunks_for_llms)} LLM по ~{sentences_per_llm} предложений")
+            logger.info(f"Обработка {len(messages)} сообщений из канала {channel_id}...")
             
-            # Создаем задачи для асинхронного выполнения
+            # Используем семафор для ограничения параллельных запросов к LLM
+            semaphore = asyncio.Semaphore(self.num_llms) 
             tasks = []
-            for i, chunk in enumerate(chunks_for_llms):
-                logger.info(f"Создание задачи для LLM {i+1}: {len(chunk)} предложений")
-                task = asyncio.create_task(self.process_chunk_async(chunk, i+1))
-                tasks.append(task)
+            for msg_text in messages:
+                 task = asyncio.create_task(self.process_single_message_ner(msg_text, semaphore))
+                 tasks.append(task)
+                 
+            # Собираем результаты
+            results = await asyncio.gather(*tasks)
             
-            # Запускаем все задачи параллельно
-            logger.info(f"Запуск {len(tasks)} параллельных LLM")
-            await asyncio.gather(*tasks)
-            logger.info(f"Все LLM для канала {channel_id} завершили работу")
+            # Фильтруем None и записываем валидные результаты в файл
+            valid_results = [res for res in results if res is not None]
+            logger.info(f"Канал {channel_id}: Получено {len(valid_results)} валидных NER результатов из {len(messages)} сообщений.")
+
+            if valid_results:
+                try:
+                    async with aiofiles.open('TEST_DATA.txt', 'a', encoding='utf-8') as f:
+                        # Записываем каждый результат с запятой и переносом строки
+                        await f.write("\n".join([res + "," for res in valid_results]) + "\n") 
+                    logger.info(f"Канал {channel_id}: Результаты ({len(valid_results)}) записаны в TEST_DATA.txt")
+                except Exception as e:
+                    logger.error(f"Канал {channel_id}: Ошибка записи результатов в файл: {e}")
             
         except Exception as e:
-            logger.error(f"Ошибка обработки канала {channel_id}: {e}")
-
-    def _extract_named_entities(self, text):
-        """Синхронное извлечение именованных сущностей через spaCy NER"""
-        if not text or not self.nlp_model:
-            return []
-        
-        try:
-            # Логируем размер входного текста
-            text_size = len(text) / 1024
-            print(f"[MEM] Размер текста: {text_size:.2f} KB")
-            
-            # Ограничиваем длину текста для обработки, если он слишком большой
-            if len(text) > 10000:
-                text = text[:10000]  # Обрабатываем только первые 10000 символов
-                print(f"[MEM] Текст обрезан до 10000 символов")
-            
-            # Обрабатываем текст с помощью spaCy
-            doc = self.nlp_model(text)
-            
-            # Список известных типов NER в русской модели spaCy
-            valid_entity_types = [
-                'PER', 'PERSON',  # Люди
-                'LOC', 'GPE',     # Места, геополитические сущности
-                'ORG',            # Организации
-                'DATE', 'TIME',   # Даты и время
-                'MONEY',          # Валюта
-                'PRODUCT',        # Продукты
-                'EVENT',          # События
-                'FAC'             # Здания, сооружения
-            ]
-            
-            # Извлекаем именованные сущности только определенных типов
-            # и фильтруем короткие
-            entities = []
-            for ent in doc.ents:
-                # Проверяем тип сущности и длину
-                if ent.label_ in valid_entity_types and len(ent.text) > 2:
-                    # Проверяем и исправляем индексы
-                    start = ent.start_char
-                    end = ent.end_char
-                    
-                    # Проверяем, что индексы в пределах текста
-                    if start >= 0 and end <= len(text):
-                        # Проверяем, что текст сущности совпадает
-                        if text[start:end] == ent.text:
-                            entities.append(ent.text.lower())
-                        else:
-                            print(f"[WARNING] Несовпадение текста сущности: {text[start:end]} != {ent.text}")
-                    else:
-                        print(f"[WARNING] Индексы вне диапазона: {start}, {end} для текста длиной {len(text)}")
-            
-            # Удаляем дубликаты
-            result = list(set(entities))
-            
-            # Очищаем большие переменные
-            del doc, entities
-            gc.collect()  # Принудительный сбор мусора после обработки NER
-            
-            return result
-            
-        except Exception as e:
-            print(f"[ERROR] Ошибка извлечения именованных сущностей: {e}")
-            print(f"[ERROR] {traceback.format_exc()}")
-            return []
-
+            logger.error(f"Ошибка обработки канала {channel_id}: {e}", exc_info=True)
+        finally:
+            gc.collect() # Сбор мусора после обработки канала
 
 async def main():
     logger.info("Запуск программы")
-    processor = DataProcessor(messages_limit=500, sentences_per_chunk=100, num_llms=10)
-    channels = [1466120158, 1511414765, 1298404306, 1322983992, 1141171940, 1600337678, 1269768079, 1331268451, 1406256149, 1238460311, 1322983992, 1447317686, 1460745685, 1195426632, 1054210809, 1380975080, 1720216167, 1498073945]
+    # Увеличиваем лимит сообщений, т.к. обрабатываем каждое
+    # Уменьшаем количество параллельных LLM, т.к. теперь это семафор
+    processor = DataProcessor(messages_limit=2000, sentences_per_chunk=100, num_llms=10) 
+    # Берем ВСЕ каналы (или определяем их по-другому)
+    # channels = [1466120158, 1511414765, 1298404306, 1322983992, 1141171940, 1600337678, 1269768079, 1331268451, 1406256149, 1238460311, 1322983992, 1447317686, 1460745685, 1195426632, 1054210809, 1380975080, 1720216167, 1498073945]
+    async with processor.SessionLocal() as session:
+        result = await session.execute(select(ChannelPosts.peer_id).distinct())
+        channels = [row[0] for row in result.fetchall() if row[0]]
+    logger.info(f"Найдено {len(channels)} уникальных каналов в БД для обработки.")
     
     logger.info(f"Начало обработки {len(channels)} каналов")
+    # Создаем файл или очищаем его перед началом
+    try:
+        async with aiofiles.open('TEST_DATA.txt', 'w', encoding='utf-8') as f:
+            await f.write("TRAINING_DATA = [\n") # Начало списка Python
+    except Exception as e:
+        logger.error(f"Не удалось создать/очистить файл TEST_DATA.txt: {e}")
+        return
+
     for channel_id in channels:
         logger.info(f"Канал {channel_id}: начало обработки")
         await processor.process_channel(channel_id)
         logger.info(f"Канал {channel_id}: обработка завершена")
-        await asyncio.sleep(5)
+        # Убрана пауза между каналами, т.к. паузы есть между батчами внутри канала
+        # await asyncio.sleep(5) 
+
+    # Завершаем список в файле
+    try:
+        async with aiofiles.open('TEST_DATA.txt', 'a', encoding='utf-8') as f:
+            # Удаляем последнюю запятую и перенос строки, если они есть
+            # await f.seek(0, os.SEEK_END) # Не работает с aiofiles так просто
+            # size = await f.tell()
+            # if size > 2:
+            #      await f.seek(size - 2)
+            #      last_chars = await f.read(2)
+            #      if last_chars == ",\n":
+            #          await f.seek(size - 2)
+            #          await f.truncate() 
+            await f.write("\n] # Конец списка Python") 
+    except Exception as e:
+        logger.error(f"Не удалось завершить файл TEST_DATA.txt: {e}")
 
     logger.info("Закрытие соединения с БД")
     await processor.engine.dispose()

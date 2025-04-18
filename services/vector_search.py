@@ -6,6 +6,8 @@ import asyncio
 from typing import List, Tuple, Optional, Dict, Any
 from datetime import datetime, timedelta
 import math
+import pickle
+import os
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -37,119 +39,268 @@ def init_globals(emb_model=None, vs=None):
         logger.info("Глобальная переменная vector_search инициализирована")
 
 class FaissIndexManager:
-    def __init__(self, omp_threads: int = 4):
+    def __init__(self, dimension: int = 1024, nlist: int = 100, m: int = 8, bits: int = 8, nprobe: int = 10, omp_threads: int = 4):
+        self.dimension = dimension
+        self.nlist = nlist
+        self.m = m
+        self.bits = bits
+        self.nprobe = nprobe
         self.omp_threads = omp_threads
         self.index = None
-        self.message_ids = []
+        # Заменяем message_ids на vector_metadata для хранения (message_id, channel_id)
+        self.vector_metadata: List[Tuple[int, int]] = []
         faiss.omp_set_num_threads(self.omp_threads)
-        logger.info(f"FAISS инициализирован с {self.omp_threads} потоками")
+        logger.info(f"FAISS инициализирован с {self.omp_threads} потоками. Параметры IVFPQ: nlist={nlist}, m={m}, bits={bits}, nprobe={nprobe}")
         
-    async def create_index(self, message_embeddings: List[Tuple[int, List[float]]]) -> bool:
+    async def train_index(self, training_embeddings: np.ndarray) -> bool:
         """
-        Создает FAISS индекс из списка эмбеддингов.
-        
+        Обучает индекс IndexIVFPQ на предоставленных векторах.
+
         Args:
-            message_embeddings: Список кортежей (id, embedding)
-            
+            training_embeddings: Numpy массив векторов для обучения.
+
         Returns:
-            bool: Успешно ли создан индекс
+            bool: Успешно ли обучен индекс.
         """
         try:
-            # Добавляем подробное логирование
-            logger.info(f"НАЧАЛО СОЗДАНИЯ ИНДЕКСА: Получено {len(message_embeddings)} эмбеддингов")
-            
-            # Фильтруем пустые и некорректные эмбеддинги
-            filtered_embeddings = []
-            expected_dim = None
-            
-            # Определяем ожидаемую размерность из первого непустого эмбеддинга
-            for msg_id, emb in message_embeddings:
-                if emb and len(emb) > 0:
-                    expected_dim = len(emb)
-                    break
-                    
-            if expected_dim is None:
-                logger.error("Не найдено ни одного валидного эмбеддинга")
+            if training_embeddings.shape[1] != self.dimension:
+                logger.error(f"Ошибка обучения: размерность векторов ({training_embeddings.shape[1]}) не совпадает с заданной ({self.dimension})")
                 return False
-                
-            logger.info(f"Ожидаемая размерность эмбеддингов: {expected_dim}")
-            
-            # Фильтруем эмбеддинги с неправильной размерностью
-            for msg_id, emb in message_embeddings:
-                if emb and len(emb) == expected_dim:
-                    filtered_embeddings.append((msg_id, emb))
-                else:
-                    logger.warning(f"Пропущен эмбеддинг для сообщения {msg_id}: неверная размерность {len(emb) if emb else 0} вместо {expected_dim}")
-            
-            logger.info(f"Отфильтровано {len(message_embeddings) - len(filtered_embeddings)} некорректных эмбеддингов")
-            
-            if not filtered_embeddings:
-                logger.error("После фильтрации не осталось валидных эмбеддингов")
-                return False
-                
-            # Извлекаем ID сообщений и эмбеддинги
-            self.message_ids = [msg_id for msg_id, _ in filtered_embeddings]
-            embeddings = [np.array(emb, dtype=np.float32) for _, emb in filtered_embeddings]
-            
-            # Создаем матрицу из эмбеддингов
-            embeddings_matrix = np.vstack(embeddings).astype(np.float32)
-            dimension = embeddings_matrix.shape[1]
-            
-            # Создаем и обучаем индекс
-            self.index = faiss.IndexFlatL2(dimension)
-            self.index.add(embeddings_matrix)
-            
-            # Глобальную переменную устанавливаем через функцию init_globals
-            init_globals(vs=self)
-            
-            logger.info(f"ИНДЕКС УСПЕШНО СОЗДАН: Размерность: {dimension}, количество векторов: {self.index.ntotal}")
+
+            if len(training_embeddings) < self.nlist:
+                 logger.warning(f"Количество векторов для обучения ({len(training_embeddings)}) меньше nlist ({self.nlist}). Качество индекса может быть низким.")
+                 # Можно продолжить обучение, но лучше иметь больше данных
+
+            logger.info(f"Начало обучения IndexIVFPQ на {len(training_embeddings)} векторах...")
+            quantizer = faiss.IndexFlatL2(self.dimension)
+            self.index = faiss.IndexIVFPQ(quantizer, self.dimension, self.nlist, self.m, self.bits)
+
+            # Используем to_thread для CPU-bound операции обучения
+            await asyncio.to_thread(self.index.train, training_embeddings)
+
+            self.index.nprobe = self.nprobe # Устанавливаем nprobe после обучения
+            logger.info(f"Индекс IndexIVFPQ успешно обучен. nprobe установлен на {self.nprobe}. Индекс готов к добавлению векторов.")
             return True
-            
         except Exception as e:
-            logger.error(f"ОШИБКА при создании FAISS индекса: {e}")
-            traceback.print_exc()
+            logger.error(f"Ошибка при обучении FAISS индекса: {e}", exc_info=True)
+            self.index = None # Сбрасываем индекс в случае ошибки
             return False
-    
-    async def search(self, query_embedding: List[float], top_k: int = 5) -> Tuple[List[int], List[float]]:
+
+    async def add_embeddings(self, message_embeddings_data: List[Tuple[int, int, List[float]]]) -> bool:
         """
-        Выполняет поиск ближайших эмбеддингов для заданного запроса.
+        Добавляет эмбеддинги с метаданными в обученный FAISS индекс.
+        Заменяет старый create_index.
+
+        Args:
+            message_embeddings_data: Список кортежей (message_id, channel_id, embedding)
+
+        Returns:
+            bool: Успешно ли добавлены эмбеддинги
+        """
+        if self.index is None or not self.index.is_trained:
+            logger.error("Ошибка добавления: индекс не существует или не обучен. Вызовите train_index() сначала.")
+            return False
+
+        try:
+            logger.info(f"НАЧАЛО ДОБАВЛЕНИЯ В ИНДЕКС: Получено {len(message_embeddings_data)} эмбеддингов с метаданными")
+
+            filtered_embeddings_with_meta = []
+            # Фильтруем эмбеддинги по размерности
+            for msg_id, channel_id, emb in message_embeddings_data:
+                if emb and len(emb) == self.dimension:
+                    filtered_embeddings_with_meta.append((msg_id, channel_id, emb))
+                else:
+                    logger.warning(f"Пропущен эмбеддинг для сообщения {msg_id} в канале {channel_id} при добавлении: неверная размерность {len(emb) if emb else 0} вместо {self.dimension}")
+
+            logger.info(f"Отфильтровано {len(message_embeddings_data) - len(filtered_embeddings_with_meta)} некорректных эмбеддингов")
+
+            if not filtered_embeddings_with_meta:
+                logger.warning("После фильтрации не осталось валидных эмбеддингов для добавления")
+                return True # Не ошибка, просто нечего добавлять
+
+            # Извлекаем метаданные и эмбеддинги
+            new_metadata = [(msg_id, channel_id) for msg_id, channel_id, _ in filtered_embeddings_with_meta]
+            new_embeddings = [np.array(emb, dtype=np.float32) for _, _, emb in filtered_embeddings_with_meta]
+
+            embeddings_matrix = np.vstack(new_embeddings).astype(np.float32)
+
+            # Используем to_thread для CPU-bound операции добавления
+            await asyncio.to_thread(self.index.add, embeddings_matrix)
+
+            self.vector_metadata.extend(new_metadata)
+
+            # Устанавливаем глобальные переменные после первого добавления (если нужно)
+            # init_globals(vs=self)
+
+            logger.info(f"В ИНДЕКС УСПЕШНО ДОБАВЛЕНО: {len(filtered_embeddings_with_meta)} векторов. Всего векторов: {self.index.ntotal}, метаданных: {len(self.vector_metadata)}")
+            return True
+
+        except Exception as e:
+            logger.error(f"ОШИБКА при добавлении в FAISS индекс: {e}", exc_info=True)
+            return False
+
+    async def save_index(self, index_filepath: str, metadata_filepath: str) -> bool:
+        """Сохраняет индекс и метаданные на диск."""
+        if self.index is None:
+            logger.error("Невозможно сохранить: индекс не существует.")
+            return False
+        try:
+            logger.info(f"Сохранение FAISS индекса в {index_filepath}...")
+            # Используем to_thread для I/O операции
+            await asyncio.to_thread(faiss.write_index, self.index, index_filepath)
+            logger.info(f"Сохранение метаданных в {metadata_filepath}...")
+            with open(metadata_filepath, 'wb') as f:
+                await asyncio.to_thread(pickle.dump, self.vector_metadata, f)
+            logger.info("Индекс и метаданные успешно сохранены.")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении индекса/метаданных: {e}", exc_info=True)
+            return False
+
+    async def load_index(self, index_filepath: str, metadata_filepath: str) -> bool:
+        """Загружает индекс и метаданные с диска."""
+        try:
+            if not os.path.exists(index_filepath) or not os.path.exists(metadata_filepath):
+                logger.error(f"Ошибка загрузки: файлы не найдены ({index_filepath}, {metadata_filepath})")
+                return False
+
+            logger.info(f"Загрузка FAISS индекса из {index_filepath}...")
+            # Используем to_thread для I/O операции
+            self.index = await asyncio.to_thread(faiss.read_index, index_filepath)
+            logger.info(f"Загрузка метаданных из {metadata_filepath}...")
+            with open(metadata_filepath, 'rb') as f:
+                self.vector_metadata = await asyncio.to_thread(pickle.load, f)
+
+            self.index.nprobe = self.nprobe # Устанавливаем nprobe после загрузки
+            logger.info(f"Индекс ({self.index.ntotal} векторов) и метаданные ({len(self.vector_metadata)}) успешно загружены. nprobe={self.nprobe}")
+
+            # Обновляем глобальные переменные после загрузки
+            init_globals(vs=self)
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка при загрузке индекса/метаданных: {e}", exc_info=True)
+            self.index = None
+            self.vector_metadata = []
+            return False
+
+    async def search(
+        self, 
+        query_embedding: List[float], 
+        top_k: int = 5, 
+        target_channel_ids: Optional[List[int]] = None
+    ) -> Tuple[List[int], List[float]]:
+        """
+        Выполняет поиск ближайших эмбеддингов для заданного запроса, 
+        с возможностью фильтрации по списку каналов.
         
         Args:
             query_embedding: Эмбеддинг запроса
-            top_k: Количество результатов
+            top_k: Количество результатов для возврата
+            target_channel_ids: Список ID каналов для фильтрации (если None или пустой, ищет по всем)
             
         Returns:
             Tuple[List[int], List[float]]: Список ID сообщений и расстояний
         """
-        if self.index is None:
-            logger.error("FAISS индекс не инициализирован")
+        # Определяем абсолютный путь к лог-файлу
+        log_file_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "found_messages.txt")) # В корневой папке Chapa
+        logger.info(f"Attempting to log FAISS results to: {log_file_path}") # Лог перед попыткой записи
+
+        # --- Блок записи в лог-файл --- 
+        try:
+            with open(log_file_path, 'a', encoding='utf-8') as f:
+                f.write(f"\n--- FAISS Search @ {datetime.now()} ---\
+")
+                # f.write(f"Query Embedding (first 10 dims): {query_embedding[:10]}\n") # Раскомментировать для отладки эмбеддинга
+                f.write(f"Target Channel IDs: {target_channel_ids}\n")
+                # Запись search_k и top_k должна быть после их определения
+        except Exception as e_log:
+            logger.error(f"Ошибка записи в лог-файл {log_file_path} (initial part): {e_log}", exc_info=True)
+        # --------------------------------
+
+        if self.index is None or self.index.ntotal == 0:
+            logger.error("FAISS индекс не инициализирован или пуст")
             return [], []
             
         try:
-            # Преобразуем запрос в нужный формат
+            if not self.index.is_trained:
+                logger.error("Поиск невозможен: индекс не обучен.")
+                return [], []
+
+            # Убедимся, что nprobe установлен (хотя он должен устанавливаться при train/load)
+            if not hasattr(self.index, 'nprobe') or self.index.nprobe != self.nprobe:
+                logger.warning(f"Устанавливаем nprobe на {self.nprobe} перед поиском")
+                self.index.nprobe = self.nprobe
+
             query_vector = np.array([query_embedding], dtype=np.float32)
             
-            # Выполняем поиск
-            distances, indices = self.index.search(query_vector, top_k)
+            results_message_ids = []
+            results_distances = []
+
+            # Проверяем, нужно ли фильтровать (список не None и не пустой)
+            should_filter = target_channel_ids is not None and len(target_channel_ids) > 0
+
+            # Определяем количество кандидатов для поиска в FAISS
+            search_k = top_k
+            if should_filter:
+                search_k = min(max(top_k * 10, 50), self.index.ntotal) # Ищем больше кандидатов для фильтрации
+
+            # Выполняем поиск в FAISS
+            distances, indices = self.index.search(query_vector, search_k)
             
-            # Получаем ID сообщений из индексов
-            result_message_ids = [self.message_ids[idx] for idx in indices[0] if idx < len(self.message_ids)]
-            result_distances = distances[0].tolist()
-            
-            return result_message_ids, result_distances
+            # --- Продолжение логирования "сырых" результатов FAISS ---            
+            try:
+                with open(log_file_path, 'a', encoding='utf-8') as f:
+                    f.write(f"Requested Top K: {top_k}, FAISS Search K: {search_k}\n") # Теперь search_k определен
+                    f.write(f"FAISS Raw Results (Top {len(indices[0])}):\n")
+                    for i, (idx, dist) in enumerate(zip(indices[0], distances[0])):
+                        if idx != -1 and idx < len(self.vector_metadata):
+                            message_id, channel_id = self.vector_metadata[idx]
+                            f.write(f"  {i+1}. Raw Index: {idx}, Msg ID: {message_id}, Chan ID: {channel_id}, Distance: {dist:.4f}\n")
+                        else:
+                             f.write(f"  {i+1}. Raw Index: {idx} (Invalid), Distance: {dist:.4f}\n")
+            except Exception as e_log_results:
+                logger.error(f"Ошибка записи в лог-файл {log_file_path} (results part): {e_log_results}", exc_info=True)
+            # ---------------------------------------------
+
+            if not should_filter:
+                # Обработка без фильтрации
+                for idx, dist in zip(indices[0], distances[0]):
+                    if idx != -1 and idx < len(self.vector_metadata): # FAISS может вернуть -1
+                        message_id, _ = self.vector_metadata[idx]
+                        results_message_ids.append(message_id)
+                        results_distances.append(dist)
+            else:
+                # Поиск с фильтрацией по списку каналов
+                search_k = min(max(top_k * 10, 50), self.index.ntotal) # Ищем еще больше кандидатов
+                
+                # Преобразуем список ID в set для быстрой проверки
+                target_channels_set = set(target_channel_ids) 
+                
+                for idx, dist in zip(indices[0], distances[0]):
+                    if idx != -1 and idx < len(self.vector_metadata): # FAISS может вернуть -1
+                        message_id, channel_id = self.vector_metadata[idx]
+                        # Проверяем вхождение в set
+                        if channel_id in target_channels_set:
+                            results_message_ids.append(message_id)
+                            results_distances.append(dist)
+                            if len(results_message_ids) >= top_k:
+                                break 
+                                
+            return results_message_ids, results_distances
             
         except Exception as e:
-            logger.error(f"Ошибка при поиске в FAISS индексе: {e}")
+            logger.error(f"Ошибка при поиске в FAISS индексе (target_channel_ids={target_channel_ids}): {e}")
             traceback.print_exc()
             return [], []
 
-    async def update_index(self, new_message_embeddings: List[Tuple[int, List[float]]]) -> bool:
+    async def update_index(self, new_message_embeddings: List[Tuple[int, int, List[float]]]) -> bool:
         """
-        Обновляет индекс новыми эмбеддингами.
-        
+        Обновляет индекс (добавляет новые эмбеддинги) и метаданные.
+        Примечание: для IVFPQ это просто вызов add_embeddings.
+
         Args:
-            new_message_embeddings: Список кортежей (id, embedding)
-            
+            new_message_embeddings: Список кортежей (message_id, channel_id, embedding)
+
         Returns:
             bool: Успешность обновления
         """
@@ -157,41 +308,16 @@ class FaissIndexManager:
             if not new_message_embeddings:
                 logger.info("Нет новых эмбеддингов для обновления индекса")
                 return True
-                
-            # Если индекс еще не создан, создаем его с новыми данными
-            if self.index is None:
-                return await self.create_index(new_message_embeddings)
-            
-            # Фильтруем эмбеддинги с правильной размерностью
-            dimension = self.index.d
-            filtered_embeddings = []
-            
-            for msg_id, emb in new_message_embeddings:
-                if emb and len(emb) == dimension:
-                    filtered_embeddings.append((msg_id, emb))
-                else:
-                    logger.warning(f"Пропущен эмбеддинг для сообщения {msg_id}: неверная размерность {len(emb) if emb else 0} вместо {dimension}")
-            
-            if not filtered_embeddings:
-                logger.warning("После фильтрации не осталось валидных эмбеддингов для обновления")
-                return True
-            
-            # Извлекаем ID и эмбеддинги
-            new_ids = [msg_id for msg_id, _ in filtered_embeddings]
-            new_embeddings = [np.array(emb, dtype=np.float32) for _, emb in filtered_embeddings]
-            
-            # Создаем матрицу из новых эмбеддингов
-            new_embeddings_matrix = np.vstack(new_embeddings).astype(np.float32)
-            
-            # Добавляем новые векторы в индекс
-            self.index.add(new_embeddings_matrix)
-            
-            # Обновляем список ID
-            self.message_ids.extend(new_ids)
-            
-            logger.info(f"FAISS индекс обновлен. Добавлено {len(filtered_embeddings)} векторов. Всего векторов: {self.index.ntotal}")
-            return True
-            
+
+            if self.index is None or not self.index.is_trained:
+                logger.error("Невозможно обновить индекс: он не существует или не обучен.")
+                return False
+
+            # Просто вызываем новый метод добавления
+            success = await self.add_embeddings(new_message_embeddings)
+            # По хорошему, здесь или в bot.py нужно периодически вызывать save_index
+            return success
+
         except Exception as e:
             logger.error(f"Ошибка при обновлении FAISS индекса: {e}")
             traceback.print_exc()
@@ -205,13 +331,13 @@ class FaissIndexManager:
             dict: Статистика индекса
         """
         if self.index is None:
-            return {"status": "not_initialized", "vectors": 0}
+            return {"status": "not_initialized", "vectors": 0, "metadata_entries": 0}
             
         return {
             "status": "active",
             "vectors": self.index.ntotal,
             "dimensions": self.index.d,
-            "message_ids_count": len(self.message_ids)
+            "metadata_entries": len(self.vector_metadata) # Обновленный ключ и значение
         } 
 
 # После класса FaissIndexManager добавляем класс для ранжирования
@@ -238,9 +364,9 @@ class VectorResearcher:
     
     class RankedMessageSearcher:
         def __init__(self, parent, 
-                     similarity_weight=0.4, 
-                     length_weight=0.1, 
-                     recency_weight=0.5,
+                     similarity_weight=0.01, 
+                     length_weight=0.01, 
+                     recency_weight=0.98,
                      full_text=False):
             self.parent = parent
             self.db_processor = parent.db_requests
@@ -342,56 +468,68 @@ class VectorResearcher:
             
             return final_score
         
-        async def search_messages(self, query_text: str, top_k: int = 5) -> List[Dict]:
+        async def search_messages(
+            self, 
+            query_text: str, 
+            top_k: int = 5, 
+            target_channel_ids: Optional[List[int]] = None
+        ) -> List[Dict] | str:
             """
             Выполняет поиск похожих сообщений по тексту запроса с ранжированием.
             
             Args:
                 query_text: Текст запроса
                 top_k: Количество результатов
+                target_channel_ids: Список ID каналов для фильтрации (если None, ищет по всем)
                 
             Returns:
                 List[Dict]: Список результатов поиска
             """
-            # Получение эмбеддинга запроса из родительского класса
-            embedding_model = self.parent.embedding_model
-            if embedding_model:
-                query_text_with_prefix = f"query: {query_text}"
-                query_embedding = await asyncio.to_thread(embedding_model.encode, query_text_with_prefix)
-                query_embedding = query_embedding.tolist()
-            else:
-                logger.error("Модель эмбеддинга не инициализирована")
-                return []
-                
-            # Поиск похожих сообщений (получаем больше, чем нужно, для последующего ранжирования)
-            candidate_k = min(top_k * 3, 20)  # Берем в 3 раза больше кандидатов, но не более 20
-            message_ids, distances = await self.faiss_manager.search(query_embedding, top_k=candidate_k)
+            # Получаем модель напрямую из глобальной области видимости
+            embedding_model = get_embedding_model() # Используем get_embedding_model() напрямую
+
+            if not embedding_model:
+                # Обновляем сообщение в логе для ясности
+                logger.error("Модель эмбеддинга не инициализирована (получено из get_embedding_model в search_messages)") 
+                return "Модель для создания эмбеддингов не найдена. Невозможно выполнить поиск."
+            
+            # Убираем лишний else блок и дублирующуюся логику получения эмбеддинга
+            query_text_with_prefix = f"query: {query_text}"
+            query_embedding = await asyncio.to_thread(embedding_model.encode, query_text_with_prefix)
+
+            candidate_k = min(top_k * 3, 20) # Оставляем как есть, т.к. faiss_manager.search сам увеличит k при фильтрации
+            
+            # Передаем target_channel_ids в search
+            message_ids, distances = await self.faiss_manager.search(
+                query_embedding, 
+                top_k=candidate_k, 
+                target_channel_ids=target_channel_ids
+            )
             
             if not message_ids:
-                logger.warning("Не найдено похожих сообщений")
+                # Логируем причину отсутствия результатов
+                if target_channel_ids:
+                     logger.warning(f"Не найдено похожих сообщений в указанных каналах: {target_channel_ids}")
+                else:
+                     logger.warning("Не найдено похожих сообщений во всем индексе")
                 return []
             
-            logger.info(f"Найдено {len(message_ids)} кандидатов, выполняем ранжирование...")
+            logger.info(f"Найдено {len(message_ids)} кандидатов для ранжирования (после фильтрации каналов, если была)...")
             
-            # Формирование кандидатов для ранжирования
             candidates = []
             for i, (msg_id, distance) in enumerate(zip(message_ids, distances)):
-                # Используем db_processor напрямую из родительского класса
                 message_data = await self.db_processor.get_document_by_id(msg_id)
                 if message_data:
-                    # Получаем данные для расчета ранга
                     message_text = message_data.get("text", "")
                     message_length = len(message_text) if message_text else 0
                     message_date = message_data.get("date")
                     
-                    # Вычисляем итоговый ранг
                     final_score = await self.calculate_final_score(
                         similarity=distance, 
                         length=message_length, 
                         date=message_date
                     )
                     
-                    # Получаем ссылку на сообщение
                     message_link = message_data.get("message_link")
                     
                     candidates.append({
@@ -404,22 +542,18 @@ class VectorResearcher:
                         "Сходство": distance,
                         "Итоговый_ранг": final_score,
                         "Канал_ID": message_data.get("channel_id"),
-                        "message_link": message_link  # Используем ссылку на сообщение
+                        "message_link": message_link
                     })
                 else:
                     logger.warning(f"Не удалось получить данные для сообщения ID: {msg_id}")
             
-            # Сортируем по итоговому рангу (выше = лучше)
             ranked_results = sorted(candidates, key=lambda x: x["Итоговый_ранг"], reverse=True)
-            
-            # Возвращаем только необходимое количество результатов
             top_results = ranked_results[:top_k]
             
-            # Обновляем номера после сортировки
             for i, result in enumerate(top_results):
                 result["№"] = i + 1
             
-            return top_results
+            return top_results # Возвращаем список словарей в случае успеха
         
         async def format_search_results(self, results: List[Dict]) -> str:
             """

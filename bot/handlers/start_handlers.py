@@ -7,14 +7,12 @@ from database.requests import DatabaseRequests
 from bot.keyboards import get_start_keyboard, get_chats_keyboard
 from states import UserStates, ChannelStates
 from services.channel_service import ChannelService
-from bot.handlers.channel_add_handler import add_channel_start
 
 router = Router()
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
+async def cmd_start(message: Message, state: FSMContext, db: DatabaseRequests):
     """Обработчик команды /start и текстовой команды 'Главное меню'."""
-    db = DatabaseRequests()
     user_exists = await db.check_user_exists(message.from_user.id)
     if not user_exists:
         await db.add_user(message.from_user.id)
@@ -30,9 +28,9 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.message(F.text.lower().in_({"главное меню", "меню"}))
 @router.message(Command("menu_kb"))
-async def show_main_menu_kb(message: Message, state: FSMContext):
+async def show_main_menu_kb(message: Message, state: FSMContext, db: DatabaseRequests):
     """Обработчик для показа главного меню (текстовые команды и кнопка /start)."""
-    await cmd_start(message, state)
+    await cmd_start(message, state, db)
 
 @router.message(F.text.lower().in_({"показать список чатов", "список чатов", "мои чаты", "чаты"}))
 @router.message(Command("show_chats"))

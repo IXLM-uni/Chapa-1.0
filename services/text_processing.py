@@ -23,21 +23,28 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Определяем корневую директорию проекта относительно этого файла
+# (предполагаем, что text_processing.py находится в services/, а services/ в корне Chapa)
+_PROJECT_ROOT = Path(__file__).parent.parent
+
 class TextProcessor:
     """Класс для фоновой обработки текстовых сообщений: извлечение лемм и создание эмбеддингов."""
 
     def __init__(self, db: DatabaseRequests, nlp_model: spacy.language.Language,
                  embedding_model_name: str,
-                 ov_model_cache_dir="openvino_models", max_workers=None):
+                 ov_model_cache_dir_name="openvino_models", max_workers=None):
         self.db = db
         self.nlp_model = nlp_model
         self.embedding_model_name = embedding_model_name
-        self.ov_model_cache_dir = Path(ov_model_cache_dir)
-        self.ov_model_path = self.ov_model_cache_dir / self.embedding_model_name.replace('/', '_')
+        # Создаем абсолютный путь к папке кеша внутри проекта
+        self.ov_model_cache_dir = _PROJECT_ROOT / ov_model_cache_dir_name
+        # Путь к конкретной модели внутри кеша (может быть не нужен, если cache_dir работает)
+        # self.ov_model_path = self.ov_model_cache_dir / self.embedding_model_name.replace('/', '_')
         self.current_embedding_model = None # Модель будет загружена лениво
         self.device = None # Устройство будет определено лениво
         
         os.makedirs(self.ov_model_cache_dir, exist_ok=True)
+        print(f"[TextProcessor] OpenVINO cache directory set to: {self.ov_model_cache_dir}")
         
         # Логируем размеры NLP модели
         nlp_size = self._get_size(nlp_model) / (1024 * 1024)
@@ -120,11 +127,15 @@ class TextProcessor:
             print("[TextProcessor] CUDA недоступен, используем OpenVINO на CPU...")
             try:
                 # OpenVINOEmbeddings сама обработает загрузку/экспорт/кэширование
-                model_kwargs = {"device": "CPU"} # Укажите "GPU", если есть Intel GPU и хотите его использовать
+                model_kwargs = {
+                    "device": "CPU",
+                    # Передаем явный путь к кешу
+                    "cache_dir": str(self.ov_model_cache_dir)
+                }
                 encode_kwargs = {"normalize_embeddings": True}
                 
                 print(f"[TextProcessor] Инициализация OpenVINOEmbeddings для модели: {self.embedding_model_name}")
-                print(f"[TextProcessor] Модель будет сохранена/загружена из: {self.ov_model_path}")
+                print(f"[TextProcessor] Модель будет сохранена/загружена в/из: {self.ov_model_cache_dir}")
                 
                 self.current_embedding_model = OpenVINOEmbeddings(
                     model_name_or_path=self.embedding_model_name,
@@ -164,7 +175,11 @@ class TextProcessor:
 
             return all_embeddings
         except Exception as e:
-            logger.error(f"Ошибка при создании эмбеддингов: {e}", exc_info=True)
+            logger.error(f"Ошибка при создании эмбеддингов для батча из {len(texts)} текстов: {e}", exc_info=True)
+            # Логируем начало текстов, вызвавших ошибку
+            if texts:
+                 log_texts_preview = [f'{i+1}: "{text[:50]}..."' for i, text in enumerate(texts[:3])] # Первые 3 для примера
+                 logger.error(f"Начало текстов в батче с ошибкой: [{', '.join(log_texts_preview)}]")
             return [[] for _ in texts]
 
     async def _batch_create_embeddings(self, texts: List[str]) -> List[List[float]]:
@@ -203,10 +218,16 @@ class TextProcessor:
                 # 2. Создаем эмбеддинги для всех текстов в батче
                 # TODO: Реализовать OpenVINO/GPU, пока используем CPU
                 print(f"[TextProcessor] Создание эмбеддингов для {len(texts_to_process)} текстов...")
+                # Логируем начало текстов
+                if texts_to_process:
+                    log_texts_preview = [f'{i+1}: "{text[:50]}..."' for i, text in enumerate(texts_to_process[:3])] # Первые 3 для примера
+                    print(f"[TextProcessor] Начало текстов для эмбеддингов: [{', '.join(log_texts_preview)}]")
+                
                 embeddings = await self._batch_create_embeddings(texts_to_process)
-                print(f"[TextProcessor] Эмбеддинги созданы.")
+                print(f"[TextProcessor] Эмбеддинги созданы (получено списков: {len(embeddings)}).")
 
                 processed_ids = []
+                embedded_post_ids = [] # Список для ID постов с обновленными эмбеддингами
                 entities_processed_count = 0
                 embeddings_updated_count = 0
                 
@@ -236,6 +257,7 @@ class TextProcessor:
                         if original_index < len(embeddings) and embeddings[original_index]:
                             await self.db.update_post_embedding(post.id, embeddings[original_index])
                             embeddings_updated_count += 1
+                            embedded_post_ids.append(post.id) # Добавляем ID в список
                         else:
                              logger.warning(f"Эмбеддинг для поста {post.id} не создан или пуст.")
                         
@@ -251,6 +273,9 @@ class TextProcessor:
                 if processed_ids:
                     await self.db.mark_posts_as_processed(processed_ids)
                     print(f"[TextProcessor] Успешно обработано: {len(processed_ids)} постов (сущностей: {entities_processed_count}, эмбеддингов: {embeddings_updated_count}).")
+                    # Логируем ID постов с обновленными эмбеддингами
+                    if embedded_post_ids:
+                        logger.info(f"[TextProcessor] IDs of posts with updated embeddings in this cycle: {embedded_post_ids}")
                 
                 # Очистка
                 del posts_batch, texts_to_process, embeddings, processed_ids, post_ids_map

@@ -11,6 +11,7 @@ class UserStates(StatesGroup): # <--- UserStates - ОСТАВЛЯЕМ КАК Е�
 
 class ChannelStates(StatesGroup): # <--- ChannelStates - УПРОЩАЕМ!
     WAITING_FOR_CHANNEL_ID = State() # <--- Оставляем WAITING_FOR_CHANNEL_ID, но можно переименовать
+    WAITING_FOR_FORWARD = State() # <--- Раскомментируем это состояние
 
 class ChannelParserStates(StatesGroup): # <--- ChannelParserStates - ОСТАВЛЯЕМ КАК ЕСТЬ (задел на будущее)
     WAITING_FOR_FORWARD_FOR_PARSE = State()

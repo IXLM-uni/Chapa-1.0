@@ -19,6 +19,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+*.json
 
 # Virtual Environment
 venv/
@@ -82,3 +83,14 @@ exports/texts_with_embeddings.json
 exports/texts_for_embedding.json
 ner_errors.txt
 llm_analysis_results.jsonl
+
+# Игнорировать все JSON файлы
+*.json
+
+# Можно добавить и другие файлы, которые не нужно коммитить
+faiss_index.ivfpq
+found_messages.txt
+*.log
+__pycache__/
+.env
+session_name # Файл сессии Telethon

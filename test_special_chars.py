@@ -61,7 +61,8 @@ def test_special_chars() -> List[Tuple[str, List[Tuple[str, str]]]]:
         # Специальные символы в событиях
         "World Cup 2022™",
         "Olympic Games®",
-        "Super Bowl®"
+        "Super Bowl®",
+        "gemini-2.5 выпустила новую игру"
     ]
     
     results = []
