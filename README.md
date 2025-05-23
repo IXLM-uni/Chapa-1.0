@@ -1,6 +1,6 @@
 # Telegram News Summary Bot
 ![image](https://github.com/user-attachments/assets/15cafed2-0af6-4001-aa26-b5de0c3a22ca)
-
+https://drive.google.com/file/d/15aNKT3HI_dSVpE27Eb7mpnp3a4OQcW69/view?usp=sharing
 **Дизайн-документ проекта:** `Nea AI Design Doc.pptx.pdf`
 
 ## Описание
